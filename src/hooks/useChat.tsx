@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 
 interface ChatParams {
   idInstance: string
@@ -10,6 +10,7 @@ interface Message {
   id: string
   text: string
   status: 'pending' | 'sent' | 'error' | 'received'
+  timestamp: number
 }
 
 interface GreenApiNotification {
@@ -28,99 +29,215 @@ interface GreenApiNotification {
   }
 }
 
+interface CheckAccResponse {
+  exist: boolean
+  chatId: string
+  fromCache: boolean
+  status: boolean
+}
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, ms)
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        clearTimeout(t)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }, { once: true })
+    }
+  })
+
 export function useChat(params: ChatParams) {
   const { idInstance, apiTokenInstance, phoneNumber } = params
-  const baseUrl = `https://api.green-api.com/waInstance${idInstance}`
-  const chatId = `${phoneNumber.replace(/\D/g, '')}@c.us`
+
+  const baseUrl = useMemo(
+    () => `https://api.green-api.com/waInstance${idInstance}`,
+    [idInstance]
+  )
+
+  const [chatId, setChatId] = useState('')
+  const [messages, setMessages] = useState<Message[]>([])
   const [sendPending, setSendPending] = useState(false)
 
-  const [messages, setMessages] = useState<Message[]>([])
+  // Сброс сообщений при смене учётки/номера.
   useEffect(() => {
     setMessages([])
   }, [idInstance, apiTokenInstance, phoneNumber])
 
   const tempIdRef = useRef(0)
+
+  // --- sendMessage ---
   const submit = useCallback(
     async (text: string) => {
-      // оптимистично добавляем отправляемое сообщение в список с временным id и статусом pending
+      if (!chatId) {
+        console.warn('useChat.submit: chatId ещё не получен')
+        return
+      }
+
       const tempId = `temp-${++tempIdRef.current}`
+      const timestamp = Date.now()
+
       setMessages((prev) => [
         ...prev,
-        { id: tempId, text, status: 'pending' },
+        { id: tempId, text, status: 'pending', timestamp },
       ])
 
-      const url = `${baseUrl}/sendMessage/${apiTokenInstance}`
-
       setSendPending(true)
+
       try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatId, message: text }),
-        })
-
-        if (!response.ok) throw new Error(`Ошибка ${response.status}: ${response.statusText}`)
-
-        const data = await response.json()
-
-        // обновляем статус и id у отправленного сообщения
-        setMessages((prev) =>
-          prev.map(msg => msg.id === tempId ? { ...msg, id: data.idMessage, status: 'sent' } : msg)
+        const res = await fetch(
+          `${baseUrl}/sendMessage/${apiTokenInstance}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chatId, message: text }),
+          }
         )
-      }
-      catch (e) {
-        // сообщение не доставлено
+
+        if (!res.ok) {
+          throw new Error(`Ошибка ${res.status}: ${res.statusText}`)
+        }
+
+        const data = await res.json()
+
         setMessages((prev) =>
-          prev.map(msg => msg.id === tempId ? { ...msg, status: 'error' } : msg)
+          prev.map((msg) =>
+            msg.id === tempId
+              ? { ...msg, id: data.idMessage, status: 'sent' }
+              : msg
+          )
+        )
+      } catch (e) {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === tempId ? { ...msg, status: 'error' } : msg
+          )
         )
         console.error(e)
-      }
-      finally {
+      } finally {
         setSendPending(false)
       }
     },
-    [idInstance, apiTokenInstance, phoneNumber]
+    [baseUrl, apiTokenInstance, chatId]
   )
 
+  // --- checkAccount: один POST при смене учётки/номера ---
   useEffect(() => {
+    const controller = new AbortController()
+
+    const run = async () => {
+      try {
+        const res = await fetch(
+          `${baseUrl}/checkAccount/${apiTokenInstance}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phoneNumber, force: true }),
+            signal: controller.signal,
+          }
+        )
+
+        if (!res.ok) {
+          throw new Error(`checkAccount: ${res.status} ${res.statusText}`)
+        }
+
+        const acc: CheckAccResponse = await res.json()
+        console.log(acc)
+        if (controller.signal.aborted) return
+
+        setChatId(acc.chatId || '')
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return
+        console.error(err)
+        setChatId('')
+      }
+    }
+
+    void run()
+
+    return () => {
+      controller.abort()
+    }
+  }, [baseUrl, apiTokenInstance, phoneNumber])
+
+  // --- polling входящих ---
+  useEffect(() => {
+    if (!chatId) return
+
     let stopped = false
+    const controller = new AbortController()
+
     const poll = async () => {
       while (!stopped) {
         try {
-          const res = await fetch(`${baseUrl}/receiveNotification/${apiTokenInstance}`)
+          const res = await fetch(
+            `${baseUrl}/receiveNotification/${apiTokenInstance}`,
+            { signal: controller.signal }
+          )
 
-          const notification: GreenApiNotification | null = await res.json().catch(() => null)
-          console.log(notification)
+          if (!res.ok) {
+            throw new Error(`receiveNotification: ${res.status}`)
+          }
+
+          const notification: GreenApiNotification | null = await res
+            .json()
+            .catch(() => null)
 
           if (stopped) break
+
           if (!notification || !notification.receiptId) {
-            await new Promise((r) => setTimeout(r, 1000))
+            await sleep(2000, controller.signal)
             continue
           }
 
-          // добавляем в чат только входящее сообщение только для текущего чата
-          if (notification.body.typeWebhook === 'incomingMessageReceived' && notification.body.senderData?.chatId === chatId) {
-            setMessages(prev => [
-              ...prev,
-              { status: 'received', id: notification.body.idMessage, text: notification.body.messageData?.textMessageData?.textMessage || '' },
-            ])
+          const { body } = notification
+
+          if (
+            body.typeWebhook === 'incomingMessageReceived' &&
+            body.senderData?.chatId === chatId
+          ) {
+            const id = body.idMessage
+            const text =
+              body.messageData?.textMessageData?.textMessage ?? ''
+
+            setMessages((prev) =>
+              prev.some((m) => m.id === id)
+                ? prev
+                : [
+                  ...prev,
+                  {
+                    id,
+                    status: 'received',
+                    text,
+                    timestamp: Date.now(),
+                  },
+                ]
+            )
           }
 
-          // удаляем любое полученное уведомление
-          await fetch(`${baseUrl}/deleteNotification/${apiTokenInstance}/${notification.receiptId}`, { method: 'DELETE' })
+          await fetch(
+            `${baseUrl}/deleteNotification/${apiTokenInstance}/${notification.receiptId}`,
+            { method: 'DELETE', signal: controller.signal }
+          )
         } catch (err) {
+          if (stopped || (err as Error).name === 'AbortError') break
           console.error(err)
-          if (stopped) break
-          await new Promise((r) => setTimeout(r, 1000))
+          try {
+            await sleep(2000, controller.signal)
+          } catch {
+            break
+          }
         }
       }
     }
 
-    poll()
+    void poll()
+
     return () => {
       stopped = true
+      controller.abort()
     }
-  }, [idInstance, apiTokenInstance, phoneNumber])
+  }, [baseUrl, apiTokenInstance, chatId])
 
   return { messages, submit, sendPending }
 }
